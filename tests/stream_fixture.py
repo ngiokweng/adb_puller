@@ -1,6 +1,7 @@
 """Produce deterministic raw binary stdout and stderr for subprocess pipe tests."""
 
 import gzip
+import hashlib
 import sys
 import time
 
@@ -21,6 +22,17 @@ if __name__ == "__main__":
         sys.stdout.buffer.flush()
         time.sleep(60)
         raise SystemExit(0)
+    if mode.startswith("archive_"):
+        payload = bytes(range(256)) * 8192
+        if mode == "archive_gzip":
+            payload = gzip.compress(payload)
+        digest = hashlib.sha256(payload).hexdigest().encode()
+        if mode == "archive_bad_hash":
+            digest = b"0" * 64
+        sys.stdout.buffer.write(payload)
+        if mode != "archive_no_footer":
+            sys.stdout.buffer.write(b"\n" + digest + b"\nADB_PULLER_ARCHIVE_OK\n")
+        raise SystemExit(1 if mode == "archive_error" else 0)
     if mode in ("range", "gzip_range"):
         start, length = map(int, sys.argv[2:4])
         if start == 0:

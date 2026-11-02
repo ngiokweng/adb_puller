@@ -7,7 +7,7 @@ import sys
 import time
 
 from .adb import AdbClient, AdbError
-from .transfer import pull_file
+from .transfer import DirectoryPullResult, pull
 
 
 def _size(value: int) -> str:
@@ -38,9 +38,10 @@ class _Progress:
             return
         self.last_update = now
         speed = copied / max(now - self.started, 0.001)
-        percent = copied / total * 100 if total else 100
+        amount = (f"{copied / total * 100:6.2f}%  {_size(copied)} / {_size(total)}"
+                  if total else f"已傳輸 {_size(copied)}")
         print(
-            f"\r{percent:6.2f}%  {_size(copied)} / {_size(total)}  {_size(int(speed))}/s",
+            f"\r{amount}  {_size(int(speed))}/s",
             end="",
             file=sys.stderr,
             flush=True,
@@ -58,23 +59,23 @@ def main(argv: list[str] | None = None) -> int:
     """Parse CLI arguments and return 0 on success, 1 on failure, or 130 on cancel."""
     parser = argparse.ArgumentParser(
         prog="adb-puller",
-        description="透過 su root 直接拉取 Android 私有檔案，並驗證大小與 SHA-256。",
+        description="透過 su root 拉取 Android 私有檔案或資料夾；目錄整批打包傳輸並驗證 SHA-256。",
     )
     parser.add_argument("--adb", default="adb", help="adb 執行檔路徑（預設：PATH 中的 adb）")
     parser.add_argument("-s", "--serial", help="裝置序號；多台裝置時請指定")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("devices", help="列出 ADB 裝置")
-    pull = commands.add_parser("pull", help="拉取一個檔案（保留手機來源）")
-    pull.add_argument("remote", help="手機上的檔案絕對路徑")
-    pull.add_argument("local", nargs="?", help="本機檔案或已存在目錄（預設：目前目錄）")
-    pull.add_argument("--overwrite", action="store_true", help="驗證成功後覆寫目的檔案")
-    pull.add_argument(
+    pull_parser = commands.add_parser("pull", help="拉取檔案或整個資料夾（保留手機來源）")
+    pull_parser.add_argument("remote", help="手機上的檔案或資料夾絕對路徑")
+    pull_parser.add_argument("local", nargs="?", help="本機目的路徑（已存在目錄下保留來源名稱；預設：目前目錄）")
+    pull_parser.add_argument("--overwrite", action="store_true", help="驗證成功後覆寫；目錄則整批驗證後合併內容")
+    pull_parser.add_argument(
         "--jobs", type=int, choices=range(1, 9), default=4, metavar="1-8",
-        help="同時傳輸的區段數（預設：4；小檔案自動減少）",
+        help="單檔同時傳輸的區段數（預設：4；目錄使用一條打包串流）",
     )
-    pull.add_argument(
+    pull_parser.add_argument(
         "--compression", choices=("auto", "gzip", "none"), default="auto",
-        help="串流壓縮（預設：auto，取樣後決定是否使用快速 gzip）",
+        help="串流壓縮（預設：auto；單檔取樣決定，目錄有 gzip 即壓縮）",
     )
     args = parser.parse_args(argv)
     client = AdbClient(
@@ -86,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "devices":
             print(client.devices(), end="")
         else:
-            result = pull_file(
+            result = pull(
                 client,
                 args.remote,
                 args.local,
@@ -94,7 +95,11 @@ def main(argv: list[str] | None = None) -> int:
                 progress=progress.update,
                 stage=progress.stage,
             )
-            print(f"完成：{result.destination}\n大小：{result.size} bytes\nSHA-256：{result.sha256}")
+            if isinstance(result, DirectoryPullResult):
+                print(f"完成：{result.destination}\n檔案數：{result.file_count}\n"
+                      f"總大小：{result.size} bytes\n目錄打包串流已通過 SHA-256 驗證。")
+            else:
+                print(f"完成：{result.destination}\n大小：{result.size} bytes\nSHA-256：{result.sha256}")
         return 0
     except KeyboardInterrupt:
         progress.finish()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 from pathlib import Path
 import random
 import re
@@ -12,7 +13,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from adb_puller.adb import AdbClient, AdbError, FileInfo
+from adb_puller.adb import AdbClient, AdbError, DirectoryEntry, FileInfo, _ArchiveReader
 
 
 class TransportTests(unittest.TestCase):
@@ -49,6 +50,53 @@ class TransportTests(unittest.TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(AdbError):
                     AdbClient().inspect_file(path)
+                with self.assertRaises(AdbError):
+                    AdbClient().path_kind(path)
+                with self.assertRaises(AdbError):
+                    AdbClient().list_directory(path)
+
+    def test_path_kind(self) -> None:
+        """Recognize both source types and reject unexpected control output."""
+        client = AdbClient()
+        for kind in ("directory", "file"):
+            with patch.object(client, "_control", return_value=kind):
+                self.assertEqual(client.path_kind("/private/source"), kind)
+        with patch.object(client, "_control", return_value="unknown"):
+            with self.assertRaises(AdbError):
+                client.path_kind("/private/source")
+
+    def test_directory_listing(self) -> None:
+        """Preserve unusual filenames and sort children after their parents."""
+        client = AdbClient()
+        filename = "空 格 ' $; `id`\n.bin"
+        payload = (
+            f"d\0.\0f\0./sub/{filename}\0d\0./empty\0"
+            "d\0./sub\0f\0./.hidden\0ADB_PULLER_OK\0"
+        ).encode()
+        with patch.object(client, "_run", return_value=payload):
+            self.assertEqual(client.list_directory("/private/source"), [
+                DirectoryEntry(".hidden", False), DirectoryEntry("empty", True),
+                DirectoryEntry("sub", True), DirectoryEntry(f"sub/{filename}", False),
+            ])
+
+    def test_invalid_directory_listing(self) -> None:
+        """Reject partial listings, escaping paths, links and invalid inventories."""
+        payloads = (
+            b"", b"d\0.\0", b"ADB_PULLER_OK\0",
+            b"banner\nd\0.\0ADB_PULLER_OK\0",
+            b"f\0.\0ADB_PULLER_OK\0", b"d\0.\0f\0./bad\xff\0ADB_PULLER_OK\0",
+            b"d\0.\0f\0/absolute\0ADB_PULLER_OK\0",
+            b"d\0.\0f\0./../escape\0ADB_PULLER_OK\0",
+            b"d\0.\0f\0./sub/file\0ADB_PULLER_OK\0",
+            b"d\0.\0f\0./same\0f\0./same\0ADB_PULLER_OK\0",
+            b"d\0.\0x\0./link\0ADB_PULLER_OK\0",
+        )
+        client = AdbClient()
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with patch.object(client, "_run", return_value=payload):
+                    with self.assertRaises(AdbError):
+                        client.list_directory("/private/source")
 
     def test_source_changes_during_hash(self) -> None:
         """Reject metadata changes while computing the remote digest."""
@@ -241,3 +289,50 @@ class TransportTests(unittest.TestCase):
         with patch("adb_puller.adb.subprocess.run", side_effect=subprocess.TimeoutExpired("adb", 30)):
             with self.assertRaises(AdbError):
                 AdbClient().devices()
+
+    def test_archive_footer_boundaries(self) -> None:
+        """Recognize a footer split across arbitrary byte boundaries."""
+        payload = b"binary\0archive\xffdata"
+        frame = payload + b"\n" + hashlib.sha256(payload).hexdigest().encode() + b"\nADB_PULLER_ARCHIVE_OK\n"
+        for width in (1, 7, 64, 4096):
+            with self.subTest(width=width):
+                chunks = iter([frame[i:i + width] for i in range(0, len(frame), width)] + [None])
+                reader = _ArchiveReader(lambda: next(chunks), lambda chunk: None)
+                self.assertEqual(reader.read(), payload)
+                self.assertTrue(reader.ended)
+
+    def _archive_stream(self, mode, callback=None, *, read_all=True):
+        client = AdbClient()
+        fixture = str(Path(__file__).with_name("stream_fixture.py"))
+        processes = []
+        original_popen = subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        try:
+            with patch.object(client, "_root_command", return_value=[sys.executable, fixture, mode]):
+                with patch("adb_puller.adb.subprocess.Popen", side_effect=spawn):
+                    with client.stream_directory("/private/source", callback or (lambda c: None)) as source:
+                        return source.read() if read_all else source.read(1)
+        finally:
+            self.assertTrue(all(process.poll() is not None and process.stdout.closed for process in processes))
+
+    def test_archive_stream_and_final_verification(self) -> None:
+        """Accept framed raw/gzip streams and check hashes even after early reads."""
+        self.assertEqual(self._archive_stream("archive_raw"), bytes(range(256)) * 8192)
+        self.assertTrue(self._archive_stream("archive_gzip").startswith(b"\x1f\x8b"))
+        self.assertEqual(self._archive_stream("archive_raw", read_all=False), b"\0")
+        for mode in ("archive_bad_hash", "archive_no_footer", "archive_error"):
+            with self.subTest(mode=mode), self.assertRaises(AdbError):
+                self._archive_stream(mode, read_all=False)
+
+    def test_archive_cancellation_reaps_process(self) -> None:
+        """Reap a blocked pipe reader when its progress callback cancels."""
+        def cancel(chunk):
+            raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._archive_stream("hang", cancel)

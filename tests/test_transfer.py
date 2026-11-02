@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import gzip
 import hashlib
+import io
+import os
 from pathlib import Path
 import tempfile
+import tarfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from adb_puller.adb import AdbError, FileInfo, Snapshot
-from adb_puller.transfer import pull_file
+from adb_puller.adb import AdbError, DirectoryEntry, FileInfo, Snapshot
+from adb_puller.transfer import DirectoryPullResult, pull, pull_directory, pull_file
 
 
 class FixtureClient:
@@ -242,3 +246,253 @@ class TransferTests(unittest.TestCase):
                 pull_file(FixtureClient(self.data), "/private/file", self.target)
         self.assertFalse(self.target.exists())
         self.assert_no_parts()
+
+
+class DirectoryTests(unittest.TestCase):
+    """Verify archive extraction and publication only after batch verification."""
+
+    def setUp(self) -> None:
+        """Create an isolated destination and a tree of controlled source files."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.entries = [
+            DirectoryEntry(".hidden", False), DirectoryEntry("empty", True),
+            DirectoryEntry("sub folder", True), DirectoryEntry("zero", False),
+            DirectoryEntry("sub folder/空 格 ' $; `id`.bin", False),
+        ]
+        self.files = {
+            "/private/source/.hidden": FixtureClient(b"hidden"),
+            "/private/source/zero": FixtureClient(b""),
+            "/private/source/sub folder/空 格 ' $; `id`.bin": FixtureClient(bytes(range(256))),
+        }
+        self.stream_calls = 0
+        self.stream_failure: BaseException | None = None
+        self.archive_override: bytes | None = None
+        self.client = SimpleNamespace(
+            path_kind=lambda remote: "directory",
+            list_directory=lambda remote: self.entries,
+            inspect_file_later=lambda remote: self.files[remote].inspect_file_later(remote),
+            inspect_file=lambda remote: self.files[remote].inspect_file(remote),
+            stream_file=lambda remote, *args: self.files[remote].stream_file(remote, *args),
+            stream_directory=self._stream_directory,
+        )
+
+    def _archive(self) -> bytes:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            root = tarfile.TarInfo(".")
+            root.type = tarfile.DIRTYPE
+            archive.addfile(root)
+            for entry in self.entries:
+                member = tarfile.TarInfo("./" + entry.path)
+                if entry.is_dir:
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+                else:
+                    data = self.files["/private/source/" + entry.path].data
+                    member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
+        return gzip.compress(output.getvalue())
+
+    @contextmanager
+    def _stream_directory(self, remote, on_chunk):
+        self.stream_calls += 1
+        payload = self._archive() if self.archive_override is None else self.archive_override
+        on_chunk(payload)
+        with io.BytesIO(payload) as source:
+            yield source
+        if self.stream_failure:
+            raise self.stream_failure
+
+    def test_recursive_download(self) -> None:
+        """Auto-detect a folder and preserve hidden, empty and nested entries."""
+        stages = []
+        updates = []
+        result = pull(self.client, "/private/source/", self.root,
+                      progress=lambda copied, total: updates.append((copied, total)),
+                      stage=stages.append)
+        self.assertIsInstance(result, DirectoryPullResult)
+        self.assertEqual(result.destination, self.root / "source")
+        self.assertEqual(result.file_count, 3)
+        self.assertEqual(result.size, 262)
+        self.assertTrue((result.destination / "empty").is_dir())
+        for remote, client in self.files.items():
+            self.assertEqual((result.destination / remote.removeprefix("/private/source/")).read_bytes(), client.data)
+            self.assertEqual(client.inspections, 0)
+        self.assertEqual(self.stream_calls, 1)
+        self.assertLess(len(stages), 6)
+        self.assertEqual(updates[-1], (len(self._archive()), 0))
+        self.assertEqual(list(self.root.rglob("*.part")), [])
+
+    def test_new_destination_and_empty_source(self) -> None:
+        """Create an explicit destination, including for an entirely empty tree."""
+        self.entries.clear()
+        target = self.root / "new" / "renamed"
+        result = pull_directory(self.client, "/private/source", target)
+        self.assertEqual(result, DirectoryPullResult(target, 0, 0))
+        self.assertTrue(target.is_dir())
+
+    def test_default_destination(self) -> None:
+        """Use the source basename in the current directory when local is omitted."""
+        self.entries.clear()
+        with patch("adb_puller.transfer.Path.cwd", return_value=self.root):
+            result = pull_directory(self.client, "/private/source/.")
+        self.assertEqual(result.destination, self.root / "source")
+
+    def test_overwrite_merges_without_removing_unrelated_files(self) -> None:
+        """Reject an existing tree by default and merge verified files on request."""
+        target = self.root / "source"
+        target.mkdir()
+        (target / ".hidden").write_bytes(b"old")
+        (target / "unrelated").write_bytes(b"keep")
+        with self.assertRaises(FileExistsError):
+            pull_directory(self.client, "/private/source", self.root)
+        self.assertEqual((target / ".hidden").read_bytes(), b"old")
+        result = pull_directory(self.client, "/private/source", self.root, overwrite=True)
+        self.assertEqual(result.file_count, 3)
+        self.assertEqual((target / ".hidden").read_bytes(), b"hidden")
+        self.assertEqual((target / "unrelated").read_bytes(), b"keep")
+
+    def test_destination_type_conflict_before_copying(self) -> None:
+        """Preflight every entry so late file/directory conflicts copy no data."""
+        target = self.root / "source"
+        (target / "sub folder" / "空 格 ' $; `id`.bin").mkdir(parents=True)
+        with self.assertRaises(IsADirectoryError):
+            pull_directory(self.client, "/private/source", self.root, overwrite=True)
+        self.assertFalse((target / ".hidden").exists())
+        self.assertTrue(all(client.inspections == 0 for client in self.files.values()))
+
+    def test_hash_failure_preserves_entire_existing_tree(self) -> None:
+        """Reject the whole staged download when the final archive hash fails."""
+        target = self.root / "source"
+        (target / "sub folder").mkdir(parents=True)
+        failed = target / "sub folder" / "空 格 ' $; `id`.bin"
+        failed.write_bytes(b"old")
+        (target / ".hidden").write_bytes(b"old hidden")
+        self.stream_failure = AdbError("archive SHA-256 mismatch")
+        with self.assertRaisesRegex(AdbError, "SHA-256"):
+            pull_directory(self.client, "/private/source", self.root, overwrite=True)
+        self.assertEqual((target / ".hidden").read_bytes(), b"old hidden")
+        self.assertEqual(failed.read_bytes(), b"old")
+        self.assertEqual(list(self.root.rglob("*.part")), [])
+
+    def test_invalid_local_names_before_creating_tree(self) -> None:
+        """Reject escaping paths and names that cannot map to distinct local files."""
+        names = ["../escape", "/absolute"]
+        if os.name == "nt":
+            names += ["CON", "bad:name", "trailing.", "sub\\escape", "line\nbreak"]
+        for name in names:
+            with self.subTest(name=name):
+                self.entries[:] = [DirectoryEntry(name, False)]
+                with self.assertRaises(AdbError):
+                    pull_directory(self.client, "/private/source", self.root)
+                self.assertFalse((self.root / "source").exists())
+        self.entries[:] = [DirectoryEntry("same", False), DirectoryEntry("same", True)]
+        with self.assertRaises(AdbError):
+            pull_directory(self.client, "/private/source", self.root)
+        if os.name == "nt":
+            self.entries[:] = [DirectoryEntry("same", False), DirectoryEntry("SAME", False)]
+            with self.assertRaises(AdbError):
+                pull_directory(self.client, "/private/source", self.root)
+
+    def test_cancellation_removes_staged_tree(self) -> None:
+        """Discard extracted files when cancellation happens before publication."""
+        self.stream_failure = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            pull_directory(self.client, "/private/source", self.root)
+        self.assertFalse((self.root / "source").exists())
+        self.assertEqual(list(self.root.rglob("*.part")), [])
+
+    def test_local_directory_link_is_rejected(self) -> None:
+        """Refuse an existing directory link that would redirect a child write."""
+        target = self.root / "source"
+        target.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        link = target / "sub folder"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest("Creating symlinks requires additional host privileges")
+        with self.assertRaises(AdbError):
+            pull_directory(self.client, "/private/source", self.root, overwrite=True)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_corrupt_or_truncated_archive(self) -> None:
+        """Discard staged output on gzip CRC errors or a missing archive tail."""
+        payload = self._archive()
+        corrupt = payload[:-8] + bytes([payload[-8] ^ 1]) + payload[-7:]
+        for data in (payload[:-20], corrupt):
+            with self.subTest(length=len(data)):
+                self.archive_override = data
+                with self.assertRaises(AdbError):
+                    pull_directory(self.client, "/private/source", self.root)
+                self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_archive_inventory_mismatch(self) -> None:
+        """Reject missing or newly added files before publishing any contents."""
+        original = self.entries.copy()
+        self.entries.pop()
+        self.archive_override = self._archive()
+        self.entries[:] = original
+        with self.assertRaises(AdbError):
+            pull_directory(self.client, "/private/source", self.root)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_destination_created_during_download(self) -> None:
+        """Preserve a directory another process creates while streaming."""
+        target = self.root / "source"
+
+        def progress(copied, total):
+            target.mkdir()
+            (target / "concurrent").write_bytes(b"keep")
+
+        with self.assertRaises(FileExistsError):
+            pull_directory(self.client, "/private/source", self.root, progress=progress)
+        self.assertEqual([path.name for path in target.iterdir()], ["concurrent"])
+        self.assertEqual(list(self.root.rglob("*.part")), [])
+
+    def test_unsafe_archive_entries(self) -> None:
+        """Reject traversal, symlinks and hardlinks outside the staged inventory."""
+        for name, kind, link in (
+            ("../escape", tarfile.REGTYPE, ""),
+            ("/absolute", tarfile.REGTYPE, ""),
+            (".hidden", tarfile.SYMTYPE, "../../escape"),
+            (".hidden", tarfile.LNKTYPE, "../../escape"),
+        ):
+            with self.subTest(name=name, kind=kind):
+                output = io.BytesIO()
+                with tarfile.open(fileobj=output, mode="w") as archive:
+                    member = tarfile.TarInfo(name)
+                    member.type, member.linkname = kind, link
+                    archive.addfile(member)
+                self.archive_override = output.getvalue()
+                with self.assertRaises(AdbError):
+                    pull_directory(self.client, "/private/source", self.root)
+                self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_raw_tar_and_hardlinks(self) -> None:
+        """Copy an internal hardlink as regular bytes without requiring host links."""
+        self.entries[:] = [DirectoryEntry("first", False), DirectoryEntry("second", False)]
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            member = tarfile.TarInfo("./first")
+            member.size = 4
+            archive.addfile(member, io.BytesIO(b"data"))
+            member = tarfile.TarInfo("./second")
+            member.type, member.linkname = tarfile.LNKTYPE, "./first"
+            archive.addfile(member)
+        self.archive_override = output.getvalue()
+        result = pull_directory(self.client, "/private/source", self.root)
+        self.assertEqual(result.size, 8)
+        self.assertEqual(result.file_count, 2)
+        self.assertEqual((result.destination / "second").read_bytes(), b"data")
+
+    def test_file_auto_detection(self) -> None:
+        """Keep file pulls and their result unchanged through the common entry."""
+        client = self.files["/private/source/.hidden"]
+        client.path_kind = lambda remote: "file"
+        result = pull(client, "/private/source/.hidden", self.root)
+        self.assertEqual(result.sha256, client.before.sha256)
+        self.assertEqual(result.destination.read_bytes(), b"hidden")

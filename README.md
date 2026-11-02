@@ -1,6 +1,6 @@
 # adb-puller
 
-直接把 Android 應用程式私有目錄中的檔案拉到電腦。手機需要 root，工具透過 `su` 讀取來源，再經 ADB 二進位串流傳送，不需要先搬到 `/sdcard`，也不會移動或刪除來源檔案。
+直接把 Android 應用程式私有目錄中的檔案或整個資料夾拉到電腦。手機需要 root，工具透過 `su` 讀取來源，再經 ADB 二進位串流傳送，不需要先搬到 `/sdcard`，也不會移動或刪除來源檔案。
 
 ## 解決的問題
 
@@ -14,8 +14,9 @@
 - Python 3.10 以上；無第三方 Python 執行期依賴。
 - Android SDK Platform-Tools 的 `adb`，已開啟並授權 USB 偵錯。
 - 手機可透過 `su -c` 取得 root，並具有 `stat`、`sha256sum`、`cat`（現代 Android 通常已內建）。首次使用時需在手機允許 ADB shell 的 root 請求。
+- 拉取資料夾時，手機另需內建的 `find`（支援 `-exec … {} +`）、`tar`、`tee`、`mkfifo` 與 `mktemp`。
 - 加速功能使用手機內建的 `dd` 與 `gzip`。缺少 `dd` 時自動改為單路；自動模式缺少 `gzip` 時不壓縮，不會在手機建立中轉檔。
-- 支援 Windows、macOS、Linux。macOS/Linux 的預設不覆寫發布方式使用硬連結，目的檔案系統須支援硬連結；exFAT 等檔案系統可使用 `--overwrite`。
+- 支援 Windows、macOS、Linux。macOS/Linux 單檔的預設不覆寫發布方式使用硬連結，目的檔案系統須支援硬連結；exFAT 等檔案系統可使用 `--overwrite`。資料夾整批下載不需要本機硬連結支援。
 
 ## 使用
 
@@ -48,11 +49,33 @@ adb-puller devices
 adb-puller pull /data/user/0/com.example.app/files/large.bin ./large.bin
 ```
 
-`-s` 與 `--adb` 放在 `pull` / `devices` 子指令之前。當前版本一次拉取一個一般檔案；不支援整個目錄，也不會自動強制停止應用程式。
+`-s` 與 `--adb` 放在 `pull` / `devices` 子指令之前。工具不會自動強制停止應用程式。
+
+### 拉取整個資料夾
+
+`pull` 自動辨識檔案或資料夾，不需要額外的遞迴旗標。資料夾會遞迴包含子目錄、隱藏檔與空目錄。整個目錄透過一條 tar 串流傳輸，預設在手機同步使用 `gzip -1` 壓縮；本機邊接收邊解壓至暫存目錄，最後核對整條打包串流的 SHA-256，成功後才發布內容。檔案數量增加時，不會為每個檔案額外啟動 ADB 或重複掃描來源計算雜湊。
+
+```powershell
+python -m adb_puller pull /data/user/0/com.example.app/files
+python -m adb_puller pull /data/user/0/com.example.app/files "D:\Backups"
+python -m adb_puller pull /data/user/0/com.example.app/files "D:\Backups" --overwrite
+```
+
+省略本機路徑時，建立 `./files/`。若 `D:\Backups` 已存在，目的地為 `D:\Backups\files\`；若指定尚不存在的路徑，該路徑就是目的資料夾。來源結尾的 `/` 不影響此規則。目的資料夾已存在時，預設拒絕下載；`--overwrite` 會在整批驗證成功後合併內容，取代同名檔案並保留本機其他檔案。
+
+資料夾的 `--compression auto` 在手機有 gzip 時啟用壓縮，缺少時傳送未壓縮 tar；`--compression gzip` 要求 gzip 可用，`--compression none` 關閉壓縮。`--jobs` 僅用於單檔的分段傳輸，資料夾使用一條連續串流。傳輸進度顯示實際收到的打包串流位元組數與速度，完成後顯示解壓後的總大小與檔案數。
+
+手機只在 `/data/local/tmp` 建立少量 FIFO、雜湊與狀態資訊，不儲存完整壓縮檔；結束後清除。本機只需容納解壓後的暫存內容；覆寫既有目錄時，原有資料與暫存內容會同時佔用空間。
+
+目錄內的符號連結、裝置檔、socket 等特殊檔案會回報錯誤；不跟隨連結。檔名若無法安全對應至本機檔案系統（例如 Windows 的保留名稱或僅大小寫不同的重複檔名），也會在傳輸前回報錯誤。
+
+傳輸、解壓或整批驗證失敗，以及發布前取消時，會清除整個暫存目錄，保留本機原有檔案。新目的目錄在驗證後整體重新命名；合併既有目錄時仍會依序發布檔案，若發布途中遇到本機 I/O 錯誤，可能已更新部分通過驗證的檔案。
+
+整批 SHA-256 驗證保證收到的打包內容與手機送出的內容一致，並會檢查 tar 內容是否符合最初的目錄清單；不會對每個來源檔案做傳輸前後的雜湊比對。備份持續變動中的應用程式資料前，仍需停止寫入，確保多檔案的一致性。
 
 ## 傳輸速度
 
-預設等同於 `--jobs 4 --compression auto`。工具依來源大小使用最多 4 路 ADB 串流，各自讀取不同區段，在本機依偏移位置組合；小檔案會自動減少路數。自動壓縮會讀取開頭最多 256 KiB 作為樣本，若快速 gzip 預估可節省超過 10% 的資料量，就使用 `gzip -1` 串流壓縮。進度與 MiB/s 以解壓後的原始大小計算。
+單檔預設等同於 `--jobs 4 --compression auto`。工具依來源大小使用最多 4 路 ADB 串流，各自讀取不同區段，在本機依偏移位置組合；小檔案會自動減少路數。自動壓縮會讀取開頭最多 256 KiB 作為樣本，若快速 gzip 預估可節省超過 10% 的資料量，就使用 `gzip -1` 串流壓縮。單檔進度與 MiB/s 以解壓後的原始大小計算。
 
 可調整並行數（1–8）或強制開關壓縮：
 
@@ -63,6 +86,17 @@ python -m adb_puller pull /data/user/0/com.example.app/files/large.bin ./large.b
 ```
 
 Log、文字與大量重複內容通常適合壓縮；ZIP、影片等資料通常維持未壓縮。若開頭樣本與其餘內容差異很大，可手動指定模式。實際速度仍取決於 USB 連線、手機 CPU、儲存裝置及其他同時使用 ADB 的程式。已開始的 pull 不會套用新設定，下一次執行才會使用加速路徑。
+
+資料夾整批傳輸在 Windows、Python 3.12、Pixel 6 上，以同一批 25 個小型 log（共 188,800 bytes），使用預設設定比較完整下載時間；兩份結果均逐檔核對測試內容：
+
+| 目錄傳輸方式 | 完整時間 | root ADB 呼叫次數 |
+| --- | ---: | ---: |
+| 舊版逐檔下載與驗證 | 25.89 秒 | 227 |
+| tar/gzip 串流與整批 SHA-256 | 1.42 秒 | 3 |
+
+這組小檔樣本約快 18.3 倍。三次呼叫分別用於辨識來源、列出目錄與傳輸整批內容，數量不隨檔案數增加；實際加速幅度依檔案大小、壓縮率與裝置而異。
+
+同一台裝置的 1,000 個 log（共 7,552,000 bytes）整批下載為 19.90 秒，同樣只呼叫 root ADB 三次，全部內容均核對一致。
 
 第一輪傳輸加速於 Windows、Pixel 6、USB 2.0 High-Speed 下，以同一份 128 MiB log 樣本進行完整 pull 實測（當時來源雜湊仍在傳輸前完成，另有一筆 pull 同時執行）：
 
@@ -76,7 +110,7 @@ Log、文字與大量重複內容通常適合壓縮；ZIP、影片等資料通�
 
 ## 完整性與失敗處理
 
-傳輸流程為：
+單檔傳輸流程為（資料夾使用上述整批打包流程）：
 
 1. 取得來源大小、檔案身分與時間，啟動背景 SHA-256 計算，隨即開始傳輸。
 2. 串流寫入目的目錄中的隨機 `.part` 暫存檔；多路傳輸依區段偏移寫入，gzip 在本機以有上限的區塊解壓。同時在手機計算初始來源 SHA-256，完成後核對來源資訊是否穩定。
@@ -102,6 +136,7 @@ python -m unittest discover -s tests -v
 ```powershell
 $env:ADB_PULLER_DEVICE_TESTS = "1"
 python -m unittest tests.test_device.DeviceTests.test_root_only_binary -v
+python -m unittest tests.test_device.DeviceTests.test_root_only_directory -v
 ```
 
 超過 4 GiB 的實際傳輸測試另須明確開啟。電腦暫存磁碟需要約 4 GiB 可用空間；手機需支援 `truncate` 與稀疏檔案，測試來源只佔少量實體空間。可用 `ANDROID_SERIAL` 選裝置，或用 `ADB` 指定執行檔。
@@ -112,4 +147,6 @@ $env:ADB_PULLER_LARGE_TEST = "1"
 python -m unittest tests.test_device.DeviceTests.test_over_four_gib -v
 ```
 
-已在 Windows、Python 3.12 與具 root 權限的 Pixel 6 上驗證：37 項一般測試、root 私有權限目錄內含特殊字元檔名的二進位檔案，以及 4,294,967,297 bytes（4 GiB + 1 byte）的完整傳輸。一般測試涵蓋平行區段亂序組合、gzip 截斷與損毀、背景雜湊與傳輸重疊執行、雜湊錯誤與來源變動，以及失敗與取消時的子程序清理；大檔案測試同時核對 SHA-256 與 4 GiB 邊界後的位元組。測試用檔案會在完成後清除。
+已在 Windows、Python 3.12 與具 root 權限的 Pixel 6 上驗證：60 項一般測試、root 私有權限目錄內含特殊字元檔名的二進位檔案、目錄的 auto/gzip/none 三種模式、符號連結拒絕處理，以及中途取消後的手機 FIFO 與本機暫存清理。一般測試涵蓋平行區段亂序組合、gzip 截斷與損毀、背景雜湊與傳輸重疊執行、目錄串流 SHA-256 與完成標記、解壓路徑與硬連結檢查、整批驗證後合併覆寫，以及失敗與取消時的清理。
+
+先前亦已驗證 4,294,967,297 bytes（4 GiB + 1 byte）的完整傳輸，同時核對 SHA-256 與 4 GiB 邊界後的位元組。測試用檔案會在完成後清除。
