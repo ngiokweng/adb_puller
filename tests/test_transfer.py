@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +25,24 @@ class FixtureClient:
         self.after = self.before
         self.inspections = 0
         self.failure: BaseException | None = None
+        self.hash_failure: BaseException | None = None
+        self.hash_ready = False
+        self.hash_resolved = False
+        self.hash_closed = False
+
+    @contextmanager
+    def inspect_file_later(self, remote: str):
+        """Provide immediate metadata and a deferred, optionally failing snapshot."""
+        def resolve():
+            self.hash_resolved = True
+            if self.hash_failure:
+                raise self.hash_failure
+            return self.inspect_file(remote)
+
+        try:
+            yield SimpleNamespace(info=self.before.info, result=resolve, done=lambda: self.hash_ready)
+        finally:
+            self.hash_closed = True
 
     def inspect_file(self, remote: str) -> Snapshot:
         """Return the initial snapshot once, then the post-transfer snapshot."""
@@ -71,6 +91,56 @@ class TransferTests(unittest.TestCase):
         result = pull_file(FixtureClient(b""), "/private/empty", self.target)
         self.assertEqual(self.target.read_bytes(), b"")
         self.assertEqual(result.size, 0)
+
+    def test_transfer_starts_before_hash_resolves(self) -> None:
+        """Start copying with metadata while the initial remote digest is pending."""
+        client = FixtureClient(self.data)
+        stream = client.stream_file
+
+        def copy(*args):
+            self.assertFalse(client.hash_resolved)
+            return stream(*args)
+
+        with patch.object(client, "stream_file", side_effect=copy):
+            pull_file(client, "/private/source", self.target)
+        self.assertTrue(client.hash_resolved)
+        self.assertTrue(client.hash_closed)
+        self.assertEqual(client.inspections, 2)
+
+    def test_deferred_hash_failure_preserves_destination(self) -> None:
+        """Refuse publication and close the pending hash if its verification fails."""
+        self.target.write_bytes(b"old")
+        for ready in (False, True):
+            with self.subTest(ready=ready):
+                client = FixtureClient(self.data)
+                client.hash_failure = AdbError("source changed while hashing")
+                client.hash_ready = ready
+                progress = []
+                with self.assertRaisesRegex(AdbError, "source changed"):
+                    pull_file(client, "/private/source", self.target, overwrite=True,
+                              progress=lambda copied, total: progress.append(copied))
+                self.assertEqual(bool(progress), not ready)
+                self.assertEqual(self.target.read_bytes(), b"old")
+                self.assertTrue(client.hash_closed)
+                self.assert_no_parts()
+
+    def test_out_of_order_hash(self) -> None:
+        """Hash the assembled file rather than the arrival order of parallel chunks."""
+        data = b"".join(bytes([i]) * 4096 for i in range(7)) + b"tail"
+        client = FixtureClient(data)
+
+        def stream(remote, destination, expected_size, on_chunk):
+            for start in reversed(range(0, len(data), 4096)):
+                chunk = data[start:start + 4096]
+                destination.seek(start)
+                destination.write(chunk)
+                on_chunk(chunk)
+            return len(data)
+
+        with patch.object(client, "stream_file", side_effect=stream):
+            result = pull_file(client, "/private/source", self.target)
+        self.assertEqual(result.sha256, client.before.sha256)
+        self.assertEqual(self.target.read_bytes(), data)
 
     def test_existing_directory(self) -> None:
         """Use the Android basename when the local destination is a directory."""

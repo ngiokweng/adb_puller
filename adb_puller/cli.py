@@ -68,8 +68,19 @@ def main(argv: list[str] | None = None) -> int:
     pull.add_argument("remote", help="手機上的檔案絕對路徑")
     pull.add_argument("local", nargs="?", help="本機檔案或已存在目錄（預設：目前目錄）")
     pull.add_argument("--overwrite", action="store_true", help="驗證成功後覆寫目的檔案")
+    pull.add_argument(
+        "--jobs", type=int, choices=range(1, 9), default=4, metavar="1-8",
+        help="同時傳輸的區段數（預設：4；小檔案自動減少）",
+    )
+    pull.add_argument(
+        "--compression", choices=("auto", "gzip", "none"), default="auto",
+        help="串流壓縮（預設：auto，取樣後決定是否使用快速 gzip）",
+    )
     args = parser.parse_args(argv)
-    client = AdbClient(args.adb, args.serial)
+    client = AdbClient(
+        args.adb, args.serial,
+        jobs=getattr(args, "jobs", 4), compression=getattr(args, "compression", "auto"),
+    )
     progress = _Progress()
     try:
         if args.command == "devices":
