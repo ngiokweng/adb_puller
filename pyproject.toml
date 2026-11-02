@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adb-puller"
+version = "0.1.0"
+description = "Pull root-protected Android files directly over ADB with SHA-256 verification."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+adb-puller = "adb_puller.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["adb_puller*"]
