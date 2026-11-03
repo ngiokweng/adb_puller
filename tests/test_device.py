@@ -22,10 +22,10 @@ class DeviceTests(unittest.TestCase):
     def setUp(self) -> None:
         """Create a unique root-owned remote directory and a local workspace."""
         self.client = AdbClient(os.environ.get("ADB", "adb"), os.environ.get("ANDROID_SERIAL"))
-        self.remote_dir = f"/data/local/tmp/adb-puller-smoke-{uuid.uuid4().hex}"
+        self.remote_dir = f"/data/local/tmp/adb_puller-smoke-{uuid.uuid4().hex}"
         self.upload = f"{self.remote_dir}.upload"
         self.remote = self.remote_dir + "/binary 空格 ' $; `id`.bin"
-        self.directory = tempfile.TemporaryDirectory(prefix="adb-puller-smoke-")
+        self.directory = tempfile.TemporaryDirectory(prefix="adb_puller-smoke-")
         self.addCleanup(self.directory.cleanup)
         self.local = Path(self.directory.name)
         self.addCleanup(self._cleanup_remote)
@@ -77,7 +77,7 @@ class DeviceTests(unittest.TestCase):
 
         def scratch_inside_source(remote):
             return original_script(remote).replace(
-                "/data/local/tmp/adb-puller-stream.", self.remote_dir + "/adb-puller-stream.",
+                "/data/local/tmp/adb_puller-stream.", self.remote_dir + "/adb_puller-stream.",
             )
 
         for compression in ("auto", "gzip", "none"):
@@ -106,7 +106,7 @@ class DeviceTests(unittest.TestCase):
 
         def scratch_inside_source(remote):
             return original_script(remote).replace(
-                "/data/local/tmp/adb-puller-stream.", self.remote_dir + "/adb-puller-stream.",
+                "/data/local/tmp/adb_puller-stream.", self.remote_dir + "/adb_puller-stream.",
             )
 
         def cancel(copied, total):

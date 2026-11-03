@@ -1,4 +1,4 @@
-# adb-puller
+# adb_puller
 
 直接把 Android 應用程式私有目錄中的檔案或整個資料夾拉到電腦。手機需要 root，工具透過 `su` 讀取來源，再經 ADB 二進位串流傳送，不需要先搬到 `/sdcard`，也不會移動或刪除來源檔案。
 
@@ -73,8 +73,8 @@ python -m adb_puller pull /data/user/0/com.example.app/files/large.bin ./large.b
 
 ```powershell
 python -m pip install -e .
-adb-puller devices
-adb-puller pull /data/user/0/com.example.app/files/large.bin ./large.bin
+adb_puller devices
+adb_puller pull /data/user/0/com.example.app/files/large.bin ./large.bin
 ```
 
 `-s` 與 `--adb` 放在 `pull` / `devices` 子指令之前。工具不會自動強制停止應用程式。

@@ -289,7 +289,7 @@ class AdbClient:
             'echo "手機沒有 gzip；請改用 --compression none。" >&2; exit 1; '
             'else compression=none; fi; fi; '
             f"cd -- {shlex.quote(remote)} || exit 1; "
-            'umask 077; work=$(mktemp -d /data/local/tmp/adb-puller-stream.XXXXXXXXXX) || exit 1; '
+            'umask 077; work=$(mktemp -d /data/local/tmp/adb_puller-stream.XXXXXXXXXX) || exit 1; '
             'source_root=$(pwd -P); exclude=; '
             'case "$work" in "${source_root%/}/"*) exclude="./${work#"${source_root%/}/"}" ;; esac; '
             'hash_pid=; '

@@ -1,4 +1,4 @@
-"""Provide the Traditional Chinese adb-puller command line interface."""
+"""Provide the Traditional Chinese adb_puller command line interface."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ class _Progress:
 def main(argv: list[str] | None = None) -> int:
     """Parse CLI arguments and return 0 on success, 1 on failure, or 130 on cancel."""
     parser = argparse.ArgumentParser(
-        prog="adb-puller",
+        prog="adb_puller",
         description="透過 su root 拉取 Android 私有檔案或資料夾；目錄整批打包傳輸並驗證 SHA-256。",
     )
     parser.add_argument("--adb", default="adb", help="adb 執行檔路徑（預設：PATH 中的 adb）")
