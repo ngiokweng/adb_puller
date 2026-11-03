@@ -1,5 +1,6 @@
 """Run the adb-puller command line interface with python -m adb_puller."""
 
-from .cli import main
+# PyInstaller executes this file as a script without a parent package.
+from adb_puller.cli import main
 
 raise SystemExit(main())

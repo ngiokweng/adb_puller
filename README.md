@@ -9,9 +9,37 @@
 
 約 4 GiB 截斷的一個可能原因是 FAT32 單檔上限（4 GiB − 1 byte）；空間不足、I/O 錯誤或來源仍在寫入也可能造成問題。不能只依大小判定原因。這個工具避免手機中轉儲存的限制，但**電腦的目的磁碟仍須有足夠空間，並支援該檔案大小**，例如使用 NTFS、exFAT、APFS 或 ext4。
 
+## 下載執行檔
+
+從此儲存庫的 [Releases](https://github.com/ngiokweng/adb_puller/releases) 頁面下載符合電腦平台的壓縮檔，解壓縮後即可在終端機使用，**不需要安裝 Python**：
+
+| 平台 | Release 附件 | 解壓後的執行檔 |
+| --- | --- | --- |
+| Windows x64 | `adb_puller-windows-x86_64.zip` | `adb_puller.exe` |
+| Linux x64（Ubuntu 22.04 或更新的相容系統） | `adb_puller-linux-x86_64.tar.gz` | `adb_puller` |
+| macOS Intel | `adb_puller-macos-x86_64.tar.gz` | `adb_puller` |
+| macOS Apple Silicon | `adb_puller-macos-arm64.tar.gz` | `adb_puller` |
+
+Windows PowerShell：
+
+```powershell
+.\adb_puller.exe devices
+.\adb_puller.exe pull /data/user/0/com.example.app/files ./backup
+.\adb_puller.exe --adb "C:\Android\platform-tools\adb.exe" devices
+```
+
+macOS / Linux：
+
+```sh
+./adb_puller devices
+./adb_puller pull /data/user/0/com.example.app/files ./backup
+```
+
+執行檔已內含 Python，`adb` 仍需另外安裝 [Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools)，加入 `PATH` 或透過 `--adb` 指定路徑。手機仍需 root 與 USB 偵錯授權。Release 的 `SHA256SUMS` 可用來核對下載的壓縮檔。
+
 ## 環境
 
-- Python 3.10 以上；無第三方 Python 執行期依賴。
+- 從原始碼執行時需要 Python 3.10 以上；無第三方 Python 執行期依賴。Release 執行檔不需要另裝 Python。
 - Android SDK Platform-Tools 的 `adb`，已開啟並授權 USB 偵錯。
 - 手機可透過 `su -c` 取得 root，並具有 `stat`、`sha256sum`、`cat`（現代 Android 通常已內建）。首次使用時需在手機允許 ADB shell 的 root 請求。
 - 拉取資料夾時，手機另需內建的 `find`（支援 `-exec … {} +`）、`tar`、`tee`、`mkfifo` 與 `mktemp`。
@@ -124,6 +152,38 @@ SHA-256 前後檢查仍會在手機額外讀取來源兩次；第一次與傳輸
 傳輸階段會顯示進度與速度。來源若持續變動，請先停止對該檔案的寫入；資料庫與其 WAL 等多檔案的一致性仍需由應用程式的備份機制或停止應用程式保證。
 
 斷線、空間不足、大小或雜湊不符、來源變動、`Ctrl+C` 等可處理的失敗會清除暫存檔並回報錯誤，不發布此次結果。系統斷電或程序被強制終止時，可能留下隨機命名的 `.part` 檔案，可自行刪除。目前不支援續傳。
+
+## 發布 Release
+
+[Release workflow](.github/workflows/release.yml) 會在推送任意新 tag 時，自動於 Windows、Linux、macOS Intel 與 Apple Silicon 上執行測試，再以 PyInstaller 打包。壓縮檔解壓後的執行檔也會在專案目錄之外測試 `--help` 與 `pull --help`，確認可獨立啟動。
+
+先將 workflow 與程式碼提交並推送至 GitHub，再建立指向該提交的 tag：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+四個平台全部成功後，workflow 透過 GitHub CLI 建立對應 tag 的 Release、上傳四份壓縮檔與 `SHA256SUMS`，並自動產生版本說明。附件上傳完成後才發布 Release；重跑同一個 tag 的 workflow 會更新同名附件。使用內建的 `GITHUB_TOKEN`，不需要另外設定個人 token。
+
+可用 GitHub CLI 查看進度與下載附件：
+
+```sh
+gh run list --workflow release.yml
+gh release view v0.1.0
+gh release download v0.1.0 --pattern 'adb_puller-windows-x86_64.zip'
+```
+
+在 Actions 頁面手動執行 **Release** workflow，只會測試、打包並保留建置產物，不會發布 Release。
+
+若要在本機打包，使用 Python 3.12 執行：
+
+```sh
+python -m pip install -r requirements-build.txt
+python -m PyInstaller --noconfirm --clean --onefile --name adb_puller --paths . --specpath build adb_puller/__main__.py
+```
+
+執行檔位於 `dist/`，對應目前電腦的作業系統與架構；跨平台版本由 GitHub Actions 分別建置。
 
 ## 測試
 

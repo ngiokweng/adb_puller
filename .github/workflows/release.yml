@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            architecture: x64
+            target: windows-x86_64
+            executable: adb_puller.exe
+          - os: ubuntu-22.04
+            architecture: x64
+            target: linux-x86_64
+            executable: adb_puller
+          - os: macos-15-intel
+            architecture: x64
+            target: macos-x86_64
+            executable: adb_puller
+          - os: macos-15
+            architecture: arm64
+            target: macos-arm64
+            executable: adb_puller
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          architecture: ${{ matrix.architecture }}
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Run tests without a device
+        env:
+          ADB_PULLER_DEVICE_TESTS: "0"
+        run: python -m unittest discover -s tests -v
+
+      - name: Build standalone executable
+        run: >-
+          python -m PyInstaller --noconfirm --clean --onefile
+          --name adb_puller --paths . --specpath build
+          adb_puller/__main__.py
+
+      - name: Package and smoke test the extracted executable
+        shell: python
+        env:
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tarfile
+          import tempfile
+          import zipfile
+
+          binary = Path("dist") / os.environ["EXECUTABLE"]
+          output = Path("release")
+          output.mkdir(exist_ok=True)
+          name = "adb_puller-" + os.environ["TARGET"]
+          if binary.suffix == ".exe":
+              archive = output / (name + ".zip")
+              with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+                  bundle.write(binary, arcname=binary.name)
+          else:
+              archive = output / (name + ".tar.gz")
+              with tarfile.open(archive, "w:gz") as bundle:
+                  bundle.add(binary, arcname=binary.name)
+
+          # Run outside the checkout so source files cannot mask missing imports.
+          with tempfile.TemporaryDirectory() as directory:
+              shutil.unpack_archive(archive, directory)
+              executable = str(Path(directory) / binary.name)
+              subprocess.run([executable, "--help"], cwd=directory, check=True)
+              subprocess.run([executable, "pull", "--help"], cwd=directory, check=True)
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: adb_puller-${{ matrix.target }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: adb_puller-*
+          merge-multiple: true
+          path: release
+
+      - name: Generate SHA-256 checksums
+        working-directory: release
+        run: sha256sum -- *.tar.gz *.zip > SHA256SUMS
+
+      - name: Create release and upload executables
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG_NAME" > /dev/null 2>&1; then
+            gh release create "$TAG_NAME" --verify-tag --title "$TAG_NAME" --generate-notes --draft
+          fi
+          gh release upload "$TAG_NAME" release/* --clobber
+          gh release edit "$TAG_NAME" --draft=false
