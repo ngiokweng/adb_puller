@@ -180,10 +180,10 @@ gh release download v0.1.0 --pattern 'adb_puller-windows-x86_64.zip'
 
 ```sh
 python -m pip install -r requirements-build.txt
-python -m PyInstaller --noconfirm --clean --onefile --name adb_puller --paths . --specpath build adb_puller/__main__.py
+python -m PyInstaller --noconfirm --clean --onefile --python-option "X utf8" --name adb_puller --paths . --specpath build adb_puller/__main__.py
 ```
 
-執行檔位於 `dist/`，對應目前電腦的作業系統與架構；跨平台版本由 GitHub Actions 分別建置。
+執行檔位於 `dist/`，對應目前電腦的作業系統與架構；跨平台版本由 GitHub Actions 分別建置。打包時啟用 UTF-8 模式，讓英文 Windows 的終端輸出或重新導向也能處理繁體中文訊息。
 
 ## 測試
 

@@ -60,8 +60,10 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Build standalone executable
+        # Frozen Python ignores PYTHONUTF8; embed it for Chinese output on Windows.
         run: >-
           python -m PyInstaller --noconfirm --clean --onefile
+          --python-option "X utf8"
           --name adb_puller --paths . --specpath build
           adb_puller/__main__.py
 
