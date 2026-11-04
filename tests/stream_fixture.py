@@ -8,8 +8,18 @@ import zlib
 
 if __name__ == "__main__":
     mode = sys.argv[1]
-    if mode in ("hash", "hash_bad", "hash_unframed"):
-        digest = "A" * 8 if mode != "hash_bad" else "invalid digest"
+    if mode in ("hash", "hash_md5", "hash_bad", "hash_unframed", "hash_range"):
+        if mode == "hash_range":
+            start, length = map(int, sys.argv[2:4])
+            data = b"".join(
+                bytes([(start + offset) // 1024**2 % 256]) * min(1024**2, length - offset)
+                for offset in range(0, length, 1024**2)
+            )
+            digest = f"{zlib.crc32(data):08x}"
+            if start == 0:
+                time.sleep(0.2)
+        else:
+            digest = "invalid digest" if mode == "hash_bad" else "A" * (32 if mode == "hash_md5" else 8)
         sys.stdout.write(digest + "\n")
         if mode != "hash_unframed":
             sys.stdout.write("ADB_PULLER_OK\n")

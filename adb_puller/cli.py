@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     pull_parser.add_argument("--overwrite", action="store_true", help="驗證成功後覆寫；目錄則整批驗證後合併內容")
     pull_parser.add_argument(
         "--jobs", type=int, choices=range(1, 9), default=4, metavar="1-8",
-        help="單檔同時傳輸的區段數（預設：4；目錄使用一條打包串流）",
+        help="單檔傳輸與 CRC-32 校驗的平行區段數（預設：4；目錄使用一條打包串流）",
     )
     pull_parser.add_argument(
         "--compression", choices=("auto", "gzip", "none"), default="auto",

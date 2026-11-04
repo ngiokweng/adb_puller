@@ -165,6 +165,89 @@ class TransportTests(unittest.TestCase):
         self.assertIsNotNone(processes[0].poll())
         self.assertTrue(processes[0].stdout.closed)
 
+    def _parallel_inspection(self, mode="hash_range", *, changed=False):
+        client = AdbClient()
+        client._caps = ("crc32", "crc32", True, True)
+        size = 32 * 1024**2 + 137
+        info = FileInfo(size, 1, 1, 1, 1)
+        after = FileInfo(size, 2, 2, 1, 1) if changed else info
+        fixture = str(Path(__file__).with_name("stream_fixture.py"))
+        processes = []
+        original_popen = subprocess.Popen
+
+        def command(script):
+            start = int(re.search(r"skip=(\d+)", script)[1]) * 1024**2
+            if mode == "spawn_error" and start:
+                raise OSError("fixture startup failure")
+            length = min(int(re.search(r"count=(\d+)", script)[1]) * 1024**2, size - start)
+            selected = "error" if mode == "error" and start == 0 else mode
+            return [sys.executable, fixture, selected, str(start), str(length)]
+
+        def spawn(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        try:
+            with patch.object(client, "_stat", side_effect=[info, after]):
+                with patch.object(client, "_root_command", side_effect=command):
+                    with patch("adb_puller.adb.subprocess.Popen", side_effect=spawn):
+                        with client.inspect_file_later("/private/file") as inspection:
+                            if mode == "hang":
+                                self.assertFalse(inspection.done())
+                                raise KeyboardInterrupt()
+                            result = inspection.result()
+                            self.assertIs(inspection.result(), result)
+                            self.assertTrue(inspection.done())
+                            return result
+        finally:
+            self.assertTrue(processes)
+            self.assertTrue(all(process.poll() is not None for process in processes))
+            self.assertTrue(all(process.stdout.closed for process in processes))
+
+    def test_parallel_source_checksum(self) -> None:
+        """Combine out-of-order remote range hashes, including a partial last block."""
+        result = self._parallel_inspection()
+        expected = b"".join(bytes([i]) * 1024**2 for i in range(32)) + bytes([32]) * 137
+        self.assertEqual(result.digest, file_digest("crc32", expected))
+        self.assertEqual(result.info.size, len(expected))
+        self.assertEqual(result.algorithm, "crc32")
+
+    def test_parallel_source_checksum_failures(self) -> None:
+        """Reject changed sources and incomplete or failed range checksums."""
+        with self.assertRaisesRegex(AdbError, "來源檔案已變動"):
+            self._parallel_inspection(changed=True)
+        for mode in ("hash_bad", "hash_unframed", "error"):
+            with self.subTest(mode=mode), self.assertRaises(AdbError):
+                self._parallel_inspection(mode)
+
+    def test_parallel_source_checksum_cleanup(self) -> None:
+        """Reap all hash workers when cancelled or when a later worker cannot start."""
+        with self.assertRaises(KeyboardInterrupt):
+            self._parallel_inspection("hang")
+        with self.assertRaisesRegex(OSError, "startup failure"):
+            self._parallel_inspection("spawn_error")
+
+    def test_source_checksum_fallbacks(self) -> None:
+        """Keep one direct reader for MD5, missing dd, small files, or jobs=1."""
+        fixture = str(Path(__file__).with_name("stream_fixture.py"))
+        cases = (
+            ("md5", True, 4, 32 * 1024**2, "hash_md5"),
+            ("crc32", False, 4, 32 * 1024**2, "hash"),
+            ("crc32", True, 1, 32 * 1024**2, "hash"),
+            ("crc32", True, 4, 1024, "hash"),
+        )
+        for algorithm, has_dd, jobs, size, mode in cases:
+            with self.subTest(algorithm=algorithm, dd=has_dd, jobs=jobs, size=size):
+                client = AdbClient(jobs=jobs)
+                client._caps = (algorithm, "md5sum" if algorithm == "md5" else "crc32", has_dd, True)
+                with patch.object(client, "_stat", return_value=FileInfo(size, 1, 1, 1, 1)):
+                    with patch.object(client, "_root_command", return_value=[sys.executable, fixture, mode]) as command:
+                        result = client.inspect_file("/private/file")
+                        self.assertEqual(result.digest, "a" * (32 if algorithm == "md5" else 8))
+                        command.assert_called_once()
+                        self.assertNotIn("dd if=", command.call_args.args[0])
+
     def _stream(self, mode: str, expected: int) -> bytes:
         client = AdbClient(jobs=1, compression="none")
         client._caps = ("crc32", "crc32", True, True)
@@ -181,6 +264,25 @@ class TransportTests(unittest.TestCase):
         """Preserve binary stdout while draining more than a pipeful of stderr."""
         data = self._stream("binary", 256 * 8192)
         self.assertEqual(data, bytes(range(256)) * 8192)
+
+    def test_pipe_chunks_are_batched(self) -> None:
+        """Keep pipe write boundaries from becoming thousands of local file writes."""
+        client = AdbClient(jobs=1, compression="none")
+        client._caps = ("crc32", "crc32", True, True)
+        size = 32 * 1024**2 + 137
+        fixture = str(Path(__file__).with_name("stream_fixture.py"))
+        command = [sys.executable, fixture, "range", "0", str(size)]
+        chunks = []
+        with patch.object(client, "_root_command", return_value=command):
+            with io.BytesIO() as output:
+                received, digest = client.stream_file(
+                    "/private/file", output, size, lambda data: chunks.append(len(data)),
+                )
+                self.assertEqual(digest, file_digest("crc32", output.getvalue()))
+        self.assertEqual(received, size)
+        self.assertEqual(sum(chunks), size)
+        self.assertLessEqual(len(chunks), 9)
+        self.assertLessEqual(max(chunks), 4 * 1024**2)
 
     def test_short_pipe(self) -> None:
         """Detect a short stream even when the subprocess exits successfully."""

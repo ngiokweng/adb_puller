@@ -699,53 +699,86 @@ class AdbClient:
     def inspect_file_later(self, remote: str) -> Iterator[_Inspection]:
         """Yield initial metadata immediately and hash an absolute remote path.
 
+        Large CRC-32 checks use up to jobs block-aligned ranges, then combine
+        their digests in file order. MD5 and devices without dd use one reader.
         Call result() inside the context to wait for a stable checksum snapshot.
-        Leaving the context reaps the ADB process, including on cancellation.
+        Leaving the context reaps every ADB process, including on cancellation.
         """
         self._validate_remote(remote)
         algorithm = self.hash_algorithm
         label = hash_label(algorithm)
         before = self._stat(remote)
-        # Hash stdin so unusual filenames never enter the digest line.
-        script = (
-            f"digest=$({self.hash_command} < {shlex.quote(remote)}) || exit 1; "
-            "digest=${digest%% *}; "
-            "printf '%s\\nADB_PULLER_OK\\n' \"$digest\""
-        )
-        with tempfile.TemporaryFile() as diagnostics:
-            process = _popen_stream(self._root_command(script), diagnostics)
+        jobs = 1
+        if algorithm == "crc32" and self.ensure_capabilities()[2]:
+            jobs = self._job_count(before.size)
+        ranges = self._ranges(before.size, jobs)
+        processes: list[tuple[subprocess.Popen, BinaryIO]] = []
+        with ExitStack() as resources:
             snapshot: Snapshot | None = None
 
             def resolve() -> Snapshot:
                 nonlocal snapshot
                 if snapshot is not None:
                     return snapshot
-                output, _ = process.communicate()
-                if process.returncode:
-                    diagnostics.seek(0)
-                    detail = (diagnostics.read(65536) + output).decode(
-                        "utf-8", errors="replace"
-                    ).strip()
-                    raise AdbError(detail or f"ADB 雜湊計算失敗（結束碼 {process.returncode}）。")
-                digest = _normalize_digest(algorithm, self._parse_control(output))
+                combined = 0
+                digest = ""
+                for (_, length), (process, diagnostics) in zip(ranges, processes):
+                    output, _ = process.communicate()
+                    if process.returncode:
+                        diagnostics.seek(0)
+                        detail = (diagnostics.read(65536) + output).decode(
+                            "utf-8", errors="replace"
+                        ).strip()
+                        raise AdbError(detail or f"ADB 雜湊計算失敗（結束碼 {process.returncode}）。")
+                    digest = _normalize_digest(algorithm, self._parse_control(output))
+                    if len(ranges) > 1:
+                        combined = _crc32_combine(combined, int(digest, 16), length)
+                if len(ranges) > 1:
+                    digest = f"{combined:08x}"
                 if self._stat(remote) != before:
                     raise AdbError(f"計算 {label} 時來源檔案已變動；請停止寫入該檔案後重試。")
                 snapshot = Snapshot(before, digest, algorithm)
                 return snapshot
 
             try:
-                yield _Inspection(before, resolve, lambda: process.poll() is not None)
+                for start, length in ranges:
+                    if len(ranges) == 1:
+                        source = f"{self.hash_command} < {shlex.quote(remote)}"
+                        prefix = ""
+                    else:
+                        source = f"{self._range_script(remote, start, length)} | {self.hash_command}"
+                        # A failed dd must not turn a partial range into a valid
+                        # checksum just because the hash command exits normally.
+                        prefix = "set -o pipefail; "
+                    # Hash stdin so unusual filenames never enter the digest line.
+                    script = (
+                        f"{prefix}digest=$({source}) || exit 1; "
+                        "digest=${digest%% *}; "
+                        "printf '%s\\nADB_PULLER_OK\\n' \"$digest\""
+                    )
+                    diagnostics = resources.enter_context(tempfile.TemporaryFile())
+                    process = _popen_stream(self._root_command(script), diagnostics)
+                    processes.append((process, diagnostics))
+                yield _Inspection(
+                    before, resolve,
+                    lambda: all(process.poll() is not None for process, _ in processes),
+                )
             finally:
-                if process.poll() is None:
-                    process.kill()
-                process.wait()
-                assert process.stdout is not None
-                process.stdout.close()
+                for process, _ in processes:
+                    if process.poll() is None:
+                        process.kill()
+                for process, _ in processes:
+                    process.wait()
+                    assert process.stdout is not None
+                    process.stdout.close()
 
-    def _transfer_options(self, remote: str, size: int) -> tuple[int, bool]:
+    def _job_count(self, size: int) -> int:
         # Avoid multiple su startups for small files; each worker gets at least
         # 8 MiB. Block-aligned ranges let Android's portable dd seek directly.
-        jobs = min(self.jobs, max(1, size // (8 * _BLOCK_SIZE)))
+        return min(self.jobs, max(1, size // (8 * _BLOCK_SIZE)))
+
+    def _transfer_options(self, remote: str, size: int) -> tuple[int, bool]:
+        jobs = self._job_count(size)
         if self.compression == "none" and jobs == 1:
             return 1, False
         _, _, has_dd, has_gzip = self.ensure_capabilities()
@@ -771,6 +804,16 @@ class AdbClient:
         blocks = (size + _BLOCK_SIZE - 1) // _BLOCK_SIZE
         span = max(1, (blocks + jobs - 1) // jobs) * _BLOCK_SIZE
         return [(start, min(span, size - start)) for start in range(0, size, span)] or [(0, 0)]
+
+    @staticmethod
+    def _range_script(remote: str, start: int, length: int) -> str:
+        # exec-out merges remote stderr into stdout. dd's progress must not
+        # enter either the binary payload or the framed checksum response.
+        return (
+            f"dd if={shlex.quote(remote)} bs={_BLOCK_SIZE} "
+            f"skip={start // _BLOCK_SIZE} "
+            f"count={(length + _BLOCK_SIZE - 1) // _BLOCK_SIZE} 2>/dev/null"
+        )
 
     def stream_file(
         self,
@@ -859,11 +902,7 @@ class AdbClient:
                     if len(ranges) == 1:
                         script = f"cat -- {shlex.quote(remote)}"
                     else:
-                        script = (
-                            f"dd if={shlex.quote(remote)} bs={_BLOCK_SIZE} "
-                            f"skip={start // _BLOCK_SIZE} "
-                            f"count={(length + _BLOCK_SIZE - 1) // _BLOCK_SIZE} 2>/dev/null"
-                        )
+                        script = self._range_script(remote, start, length)
                     if compressed:
                         # stdin redirection preserves the source even for gzip
                         # implementations whose default file mode removes input.
@@ -876,6 +915,10 @@ class AdbClient:
                     process = _popen_stream(self._root_command(script), diagnostics)
                     processes.append(process)
                     assert process.stdout is not None
+                    # exec-out can write only a few KiB at a time. Fill larger
+                    # blocks before decoding/queuing to avoid thousands of tiny
+                    # random writes and checksum updates on the destination.
+                    process.stdout = io.BufferedReader(process.stdout, buffer_size=_CHUNK_SIZE)
                     executor.submit(receive, process, diagnostics, start, length)
 
                 finished = 0

@@ -108,6 +108,26 @@ class DeviceTests(unittest.TestCase):
                 self.assertTrue((result.destination / "sub folder" / "empty").is_dir())
                 self.assertEqual(list(self.local.rglob("*.part")), [])
 
+    def test_parallel_source_checksum(self) -> None:
+        """Verify a partial final block with real dd/hash pipelines and reject dd failure."""
+        quoted = shlex.quote(self.remote)
+        self._root(
+            f"dd if=/dev/zero of={quoted} bs=1048576 count=32 2>/dev/null; "
+            f"printf tail >> {quoted}"
+        )
+        algorithm = self.client.hash_algorithm
+        expected = _digest(algorithm, [bytes(1024**2)] * 32 + [b"tail"])
+        for jobs in (1, 4, 8):
+            with self.subTest(jobs=jobs):
+                self.client.jobs = jobs
+                snapshot = self.client.inspect_file(self.remote)
+                self.assertEqual(snapshot.digest, expected)
+                self.assertEqual(snapshot.info.size, 32 * 1024**2 + 4)
+        if algorithm == "crc32":
+            with patch.object(self.client, "_range_script", return_value="false"):
+                with self.assertRaises(AdbError):
+                    self.client.inspect_file(self.remote)
+
     def test_directory_listing_rejects_symlinks(self) -> None:
         """Reject child links without traversing or copying their targets."""
         self._root(f"ln -s /proc/version {shlex.quote(self.remote)}")
