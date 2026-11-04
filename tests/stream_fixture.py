@@ -1,15 +1,15 @@
 """Produce deterministic raw binary stdout and stderr for subprocess pipe tests."""
 
 import gzip
-import hashlib
 import sys
 import time
+import zlib
 
 
 if __name__ == "__main__":
     mode = sys.argv[1]
     if mode in ("hash", "hash_bad", "hash_unframed"):
-        digest = "A" * 64 if mode != "hash_bad" else "invalid digest"
+        digest = "A" * 8 if mode != "hash_bad" else "invalid digest"
         sys.stdout.write(digest + "\n")
         if mode != "hash_unframed":
             sys.stdout.write("ADB_PULLER_OK\n")
@@ -26,9 +26,9 @@ if __name__ == "__main__":
         payload = bytes(range(256)) * 8192
         if mode == "archive_gzip":
             payload = gzip.compress(payload)
-        digest = hashlib.sha256(payload).hexdigest().encode()
+        digest = f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}".encode()
         if mode == "archive_bad_hash":
-            digest = b"0" * 64
+            digest = b"0" * 8
         sys.stdout.buffer.write(payload)
         if mode != "archive_no_footer":
             sys.stdout.buffer.write(b"\n" + digest + b"\nADB_PULLER_ARCHIVE_OK\n")

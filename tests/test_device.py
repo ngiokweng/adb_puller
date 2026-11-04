@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import zlib
 from pathlib import Path
 import shlex
 import tempfile
@@ -13,6 +14,21 @@ import uuid
 from unittest.mock import patch
 
 from adb_puller import AdbClient, AdbError, pull, pull_file
+
+
+def _digest(algorithm: str, chunks: list[bytes]) -> str:
+    """Hash chunks with the same algorithm the pull selected on the device."""
+    if algorithm == "crc32":
+        crc = 0
+        for chunk in chunks:
+            crc = zlib.crc32(chunk, crc)
+        return f"{crc & 0xFFFFFFFF:08x}"
+    if algorithm != "md5":
+        raise AssertionError(algorithm)
+    hasher = hashlib.md5()
+    for chunk in chunks:
+        hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 @unittest.skipUnless(os.environ.get("ADB_PULLER_DEVICE_TESTS") == "1", "real-device tests are opt-in")
@@ -57,7 +73,7 @@ class DeviceTests(unittest.TestCase):
         output = self.local / "received.bin"
         result = pull_file(self.client, self.remote, output)
         self.assertEqual(output.read_bytes(), data)
-        self.assertEqual(result.sha256, hashlib.sha256(data).hexdigest())
+        self.assertEqual(result.digest, _digest(result.algorithm, [data]))
         self.assertEqual(result.size, len(data))
 
     def test_root_only_directory(self) -> None:
@@ -155,12 +171,9 @@ class DeviceTests(unittest.TestCase):
         self.assertEqual(output.stat().st_size, size)
         # Derive an independent known digest in bounded memory. The last byte
         # ensures the test cannot pass after silently dropping data at 4 GiB.
-        expected = hashlib.sha256()
         zeros = bytes(4 * 1024**2)
-        for _ in range(1024):
-            expected.update(zeros)
-        expected.update(b"\x01")
-        self.assertEqual(result.sha256, expected.hexdigest())
+        chunks = [zeros] * 1024 + [b"\x01"]
+        self.assertEqual(result.digest, _digest(result.algorithm, chunks))
         with output.open("rb") as stream:
             stream.seek(4 * 1024**3)
             self.assertEqual(stream.read(), b"\x01")

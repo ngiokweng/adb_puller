@@ -6,7 +6,7 @@ import argparse
 import sys
 import time
 
-from .adb import AdbClient, AdbError
+from .adb import AdbClient, AdbError, hash_label
 from .transfer import DirectoryPullResult, pull
 
 
@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     """Parse CLI arguments and return 0 on success, 1 on failure, or 130 on cancel."""
     parser = argparse.ArgumentParser(
         prog="adb_puller",
-        description="透過 su root 拉取 Android 私有檔案或資料夾；目錄整批打包傳輸並驗證 SHA-256。",
+        description="透過 su root 拉取 Android 私有檔案或資料夾；目錄整批打包傳輸並以 CRC-32 或 MD5 驗證。",
     )
     parser.add_argument("--adb", default="adb", help="adb 執行檔路徑（預設：PATH 中的 adb）")
     parser.add_argument("-s", "--serial", help="裝置序號；多台裝置時請指定")
@@ -97,9 +97,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             if isinstance(result, DirectoryPullResult):
                 print(f"完成：{result.destination}\n檔案數：{result.file_count}\n"
-                      f"總大小：{result.size} bytes\n目錄打包串流已通過 SHA-256 驗證。")
+                      f"總大小：{result.size} bytes\n"
+                      f"目錄打包串流已通過 {hash_label(result.algorithm)} 驗證。")
             else:
-                print(f"完成：{result.destination}\n大小：{result.size} bytes\nSHA-256：{result.sha256}")
+                print(f"完成：{result.destination}\n大小：{result.size} bytes\n"
+                      f"{hash_label(result.algorithm)}：{result.digest}")
         return 0
     except KeyboardInterrupt:
         progress.finish()

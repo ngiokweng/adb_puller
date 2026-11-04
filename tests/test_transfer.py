@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import gzip
-import hashlib
 import io
 import os
 from pathlib import Path
@@ -14,54 +13,66 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from adb_puller.adb import AdbError, DirectoryEntry, FileInfo, Snapshot
+from adb_puller.adb import AdbError, DirectoryEntry, FileInfo, Snapshot, file_digest
 from adb_puller.transfer import DirectoryPullResult, pull, pull_directory, pull_file
 
 
 class FixtureClient:
     """Provide controlled file bytes and source snapshots for transfer tests."""
 
-    def __init__(self, data: bytes, *, delivered: bytes | None = None) -> None:
+    def __init__(self, data: bytes, *, delivered: bytes | None = None, algorithm: str = "crc32") -> None:
         """Configure source data and optionally different bytes delivered by ADB."""
         self.data = data
         self.delivered = data if delivered is None else delivered
-        self.before = Snapshot(FileInfo(len(data), 1, 1, 2, 3), hashlib.sha256(data).hexdigest())
-        self.after = self.before
+        self.algorithm = algorithm
+        self.info = FileInfo(len(data), 1, 1, 2, 3)
+        self.after_info = self.info
+        self.after_digest = file_digest(algorithm, data)
         self.inspections = 0
         self.failure: BaseException | None = None
         self.hash_failure: BaseException | None = None
-        self.hash_ready = False
-        self.hash_resolved = False
+        self.inspect_started = False
         self.hash_closed = False
+
+    def ensure_capabilities(self) -> tuple[str, str, bool, bool]:
+        """Pretend the phone already selected this fixture's checksum."""
+        command = "crc32" if self.algorithm == "crc32" else "md5sum"
+        return self.algorithm, command, True, True
+
+    @property
+    def hash_algorithm(self) -> str:
+        """Return the checksum algorithm used for this fixture."""
+        return self.algorithm
+
+    def file_info(self, remote: str) -> FileInfo:
+        """Return the stable metadata captured before transfer."""
+        return self.info
 
     @contextmanager
     def inspect_file_later(self, remote: str):
-        """Provide immediate metadata and a deferred, optionally failing snapshot."""
+        """Provide a post-transfer snapshot, optionally failing when resolved."""
+        self.inspect_started = True
+
         def resolve():
-            self.hash_resolved = True
+            self.inspections += 1
             if self.hash_failure:
                 raise self.hash_failure
-            return self.inspect_file(remote)
+            return Snapshot(self.after_info, self.after_digest, self.algorithm)
 
         try:
-            yield SimpleNamespace(info=self.before.info, result=resolve, done=lambda: self.hash_ready)
+            yield SimpleNamespace(info=self.after_info, result=resolve, done=lambda: True)
         finally:
             self.hash_closed = True
 
-    def inspect_file(self, remote: str) -> Snapshot:
-        """Return the initial snapshot once, then the post-transfer snapshot."""
-        self.inspections += 1
-        return self.before if self.inspections == 1 else self.after
-
-    def stream_file(self, remote, destination, expected_size, on_chunk) -> int:
-        """Deliver fixture bytes, optionally fail, and return delivered byte count."""
+    def stream_file(self, remote, destination, expected_size, on_chunk) -> tuple[int, str]:
+        """Deliver fixture bytes, optionally fail, and return their file-order digest."""
         for offset in range(0, len(self.delivered), 4096):
             chunk = self.delivered[offset : offset + 4096]
             destination.write(chunk)
             on_chunk(chunk)
         if self.failure:
             raise self.failure
-        return len(self.delivered)
+        return len(self.delivered), file_digest(self.algorithm, self.delivered)
 
 
 class TransferTests(unittest.TestCase):
@@ -86,7 +97,8 @@ class TransferTests(unittest.TestCase):
                            progress=lambda copied, total: progress.append((copied, total)))
         self.assertEqual(self.target.read_bytes(), self.data)
         self.assertEqual(result.size, len(self.data))
-        self.assertEqual(result.sha256, hashlib.sha256(self.data).hexdigest())
+        self.assertEqual(result.digest, file_digest("crc32", self.data))
+        self.assertEqual(result.algorithm, "crc32")
         self.assertEqual(progress[-1], (len(self.data), len(self.data)))
         self.assert_no_parts()
 
@@ -96,42 +108,36 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), b"")
         self.assertEqual(result.size, 0)
 
-    def test_transfer_starts_before_hash_resolves(self) -> None:
-        """Start copying with metadata while the initial remote digest is pending."""
+    def test_transfer_does_not_wait_for_source_hash(self) -> None:
+        """Copy before the post-transfer source checksum starts."""
         client = FixtureClient(self.data)
         stream = client.stream_file
 
         def copy(*args):
-            self.assertFalse(client.hash_resolved)
+            self.assertFalse(client.inspect_started)
             return stream(*args)
 
         with patch.object(client, "stream_file", side_effect=copy):
             pull_file(client, "/private/source", self.target)
-        self.assertTrue(client.hash_resolved)
+        self.assertTrue(client.inspect_started)
         self.assertTrue(client.hash_closed)
-        self.assertEqual(client.inspections, 2)
+        self.assertEqual(client.inspections, 1)
 
     def test_deferred_hash_failure_preserves_destination(self) -> None:
-        """Refuse publication and close the pending hash if its verification fails."""
+        """Refuse publication and close the checksum if post-transfer verification fails."""
         self.target.write_bytes(b"old")
-        for ready in (False, True):
-            with self.subTest(ready=ready):
-                client = FixtureClient(self.data)
-                client.hash_failure = AdbError("source changed while hashing")
-                client.hash_ready = ready
-                progress = []
-                with self.assertRaisesRegex(AdbError, "source changed"):
-                    pull_file(client, "/private/source", self.target, overwrite=True,
-                              progress=lambda copied, total: progress.append(copied))
-                self.assertEqual(bool(progress), not ready)
-                self.assertEqual(self.target.read_bytes(), b"old")
-                self.assertTrue(client.hash_closed)
-                self.assert_no_parts()
+        client = FixtureClient(self.data)
+        client.hash_failure = AdbError("source changed while hashing")
+        with self.assertRaisesRegex(AdbError, "source changed"):
+            pull_file(client, "/private/source", self.target, overwrite=True)
+        self.assertEqual(self.target.read_bytes(), b"old")
+        self.assertTrue(client.hash_closed)
+        self.assert_no_parts()
 
     def test_out_of_order_hash(self) -> None:
-        """Hash the assembled file rather than the arrival order of parallel chunks."""
+        """Hash the assembled file when parallel MD5 ranges cannot be combined."""
         data = b"".join(bytes([i]) * 4096 for i in range(7)) + b"tail"
-        client = FixtureClient(data)
+        client = FixtureClient(data, algorithm="md5")
 
         def stream(remote, destination, expected_size, on_chunk):
             for start in reversed(range(0, len(data), 4096)):
@@ -139,11 +145,12 @@ class TransferTests(unittest.TestCase):
                 destination.seek(start)
                 destination.write(chunk)
                 on_chunk(chunk)
-            return len(data)
+            return len(data), None
 
         with patch.object(client, "stream_file", side_effect=stream):
             result = pull_file(client, "/private/source", self.target)
-        self.assertEqual(result.sha256, client.before.sha256)
+        self.assertEqual(result.digest, file_digest("md5", data))
+        self.assertEqual(result.algorithm, "md5")
         self.assertEqual(self.target.read_bytes(), data)
 
     def test_existing_directory(self) -> None:
@@ -185,7 +192,7 @@ class TransferTests(unittest.TestCase):
         """Reject corrupt bytes even when their count matches, preserving old data."""
         self.target.write_bytes(b"old")
         corrupt = b"!" + self.data[1:]
-        with self.assertRaisesRegex(AdbError, "SHA-256"):
+        with self.assertRaisesRegex(AdbError, "不一致"):
             pull_file(FixtureClient(self.data, delivered=corrupt), "/private/file",
                       self.target, overwrite=True)
         self.assertEqual(self.target.read_bytes(), b"old")
@@ -194,7 +201,7 @@ class TransferTests(unittest.TestCase):
     def test_source_changed(self) -> None:
         """Reject a source that changed after otherwise correct bytes arrived."""
         client = FixtureClient(self.data)
-        client.after = Snapshot(client.before.info, "0" * 64)
+        client.after_digest = "0" * 8
         with self.assertRaises(AdbError):
             pull_file(client, "/private/file", self.target)
         self.assertFalse(self.target.exists())
@@ -230,7 +237,7 @@ class TransferTests(unittest.TestCase):
     def test_destination_created_during_transfer(self) -> None:
         """Preserve a destination created by another process during transfer."""
         def stage(message: str) -> None:
-            if "SHA-256" in message and list(self.root.glob("*.part")):
+            if "串流" in message and list(self.root.glob("*.part")):
                 self.target.write_bytes(b"created concurrently")
 
         with self.assertRaises(FileExistsError):
@@ -276,6 +283,8 @@ class DirectoryTests(unittest.TestCase):
             inspect_file=lambda remote: self.files[remote].inspect_file(remote),
             stream_file=lambda remote, *args: self.files[remote].stream_file(remote, *args),
             stream_directory=self._stream_directory,
+            ensure_capabilities=lambda: ("crc32", "crc32", True, True),
+            hash_algorithm="crc32",
         )
 
     def _archive(self) -> bytes:
@@ -494,5 +503,5 @@ class DirectoryTests(unittest.TestCase):
         client = self.files["/private/source/.hidden"]
         client.path_kind = lambda remote: "file"
         result = pull(client, "/private/source/.hidden", self.root)
-        self.assertEqual(result.sha256, client.before.sha256)
+        self.assertEqual(result.digest, client.after_digest)
         self.assertEqual(result.destination.read_bytes(), b"hidden")

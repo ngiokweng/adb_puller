@@ -18,7 +18,7 @@ class CliTests(unittest.TestCase):
         """Show a folder count or a file digest and forward transfer settings."""
         for result, expected in (
             (DirectoryPullResult(Path("backup"), 123, 2), "檔案數：2"),
-            (PullResult(Path("backup.bin"), 123, "a" * 64), "SHA-256：" + "a" * 64),
+            (PullResult(Path("backup.bin"), 123, "ab", "crc32"), "CRC-32：ab"),
         ):
             with self.subTest(result=result):
                 output = io.StringIO()

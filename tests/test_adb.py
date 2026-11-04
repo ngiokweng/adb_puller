@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import hashlib
 from pathlib import Path
 import random
 import re
@@ -12,8 +11,12 @@ import subprocess
 import sys
 import unittest
 from unittest.mock import patch
+import zlib
 
-from adb_puller.adb import AdbClient, AdbError, DirectoryEntry, FileInfo, _ArchiveReader
+from adb_puller.adb import (
+    AdbClient, AdbError, DirectoryEntry, FileInfo, _ArchiveReader, _crc32_combine,
+    _parse_capabilities, file_digest,
+)
 
 
 class TransportTests(unittest.TestCase):
@@ -102,6 +105,7 @@ class TransportTests(unittest.TestCase):
         """Reject metadata changes while computing the remote digest."""
         client = AdbClient()
         fixture = str(Path(__file__).with_name("stream_fixture.py"))
+        client._caps = ("crc32", "crc32", True, True)
         with patch.object(client, "_stat", side_effect=[FileInfo(1, 1, 1, 1, 1),
                                                        FileInfo(2, 2, 2, 1, 1)]):
             with patch.object(client, "_root_command", return_value=[sys.executable, fixture, "hash"]):
@@ -111,6 +115,7 @@ class TransportTests(unittest.TestCase):
     def test_deferred_hash_result(self) -> None:
         """Resolve a framed hash with stable metadata and reuse its snapshot."""
         client = AdbClient()
+        client._caps = ("crc32", "crc32", True, True)
         info = FileInfo(1, 1, 1, 1, 1)
         fixture = str(Path(__file__).with_name("stream_fixture.py"))
         with patch.object(client, "_stat", return_value=info) as stat:
@@ -118,7 +123,8 @@ class TransportTests(unittest.TestCase):
                 with client.inspect_file_later("/private/file") as inspection:
                     self.assertEqual(inspection.info, info)
                     result = inspection.result()
-                    self.assertEqual(result.sha256, "a" * 64)
+                    self.assertEqual(result.digest, "a" * 8)
+                    self.assertEqual(result.algorithm, "crc32")
                     self.assertTrue(inspection.done())
                     self.assertIs(inspection.result(), result)
             self.assertEqual(stat.call_count, 2)
@@ -126,6 +132,7 @@ class TransportTests(unittest.TestCase):
     def test_deferred_hash_errors(self) -> None:
         """Reject malformed digests, missing framing, and failed hash commands."""
         client = AdbClient()
+        client._caps = ("crc32", "crc32", True, True)
         fixture = str(Path(__file__).with_name("stream_fixture.py"))
         for mode in ("hash_bad", "hash_unframed", "error"):
             with self.subTest(mode=mode), self.assertRaises(AdbError):
@@ -136,6 +143,7 @@ class TransportTests(unittest.TestCase):
     def test_deferred_hash_cancellation(self) -> None:
         """Enter before the hasher exits and reap it immediately on cancellation."""
         client = AdbClient()
+        client._caps = ("crc32", "crc32", True, True)
         fixture = str(Path(__file__).with_name("stream_fixture.py"))
         processes = []
         original_popen = subprocess.Popen
@@ -159,11 +167,14 @@ class TransportTests(unittest.TestCase):
 
     def _stream(self, mode: str, expected: int) -> bytes:
         client = AdbClient(jobs=1, compression="none")
+        client._caps = ("crc32", "crc32", True, True)
         output = io.BytesIO()
         fixture = str(Path(__file__).with_name("stream_fixture.py"))
         with patch.object(client, "_root_command", return_value=[sys.executable, fixture, mode]):
             with patch.object(client, "_transfer_options", return_value=(1, mode.startswith("gzip"))):
-                client.stream_file("/private/file", output, expected, lambda chunk: None)
+                received, digest = client.stream_file("/private/file", output, expected, lambda chunk: None)
+        self.assertEqual(received, expected)
+        self.assertEqual(digest, file_digest("crc32", output.getvalue()))
         return output.getvalue()
 
     def test_binary_pipe_and_large_stderr(self) -> None:
@@ -202,20 +213,52 @@ class TransportTests(unittest.TestCase):
     def test_auto_compression(self) -> None:
         """Compress repetitive samples and keep incompressible data uncompressed."""
         client = AdbClient()
-        with patch.object(client, "_control", return_value="dd gzip"):
-            with patch.object(client, "_run", return_value=b"log line\n" * 30000):
-                self.assertEqual(client._transfer_options("/private/file", 32 * 1024**2), (4, True))
-            with patch.object(client, "_run", return_value=random.Random(0).randbytes(262144)):
-                self.assertEqual(client._transfer_options("/private/file", 32 * 1024**2), (4, False))
+        client._caps = ("crc32", "crc32", True, True)
+        with patch.object(client, "_run", return_value=b"log line\n" * 30000):
+            self.assertEqual(client._transfer_options("/private/file", 32 * 1024**2), (4, True))
+        with patch.object(client, "_run", return_value=random.Random(0).randbytes(262144)):
+            self.assertEqual(client._transfer_options("/private/file", 32 * 1024**2), (4, False))
 
     def test_missing_optional_tools(self) -> None:
         """Fall back to cat without optional tools and fail an explicit gzip request."""
         client = AdbClient()
-        with patch.object(client, "_control", return_value=" "):
-            self.assertEqual(client._transfer_options("/private/file", 32 * 1024**2), (1, False))
-            client.compression = "gzip"
-            with self.assertRaisesRegex(AdbError, "gzip"):
-                client._transfer_options("/private/file", 32 * 1024**2)
+        client._caps = ("md5", "md5sum", False, False)
+        self.assertEqual(client._transfer_options("/private/file", 32 * 1024**2), (1, False))
+        client.compression = "gzip"
+        with self.assertRaisesRegex(AdbError, "gzip"):
+            client._transfer_options("/private/file", 32 * 1024**2)
+
+    def test_capability_probe_parsing(self) -> None:
+        """Accept a verified CRC-32 applet and reject an unexpected probe line."""
+        self.assertEqual(
+            _parse_capabilities("crc32\ttoybox crc32\tdd\tgzip"),
+            ("crc32", "toybox crc32", True, True),
+        )
+        self.assertEqual(_parse_capabilities("md5\tmd5sum\t\t"), ("md5", "md5sum", False, False))
+        with self.assertRaises(AdbError):
+            _parse_capabilities("sha256\tsha256sum\tdd\tgzip")
+
+    def test_crc32_combine_matches_contiguous_bytes(self) -> None:
+        """Combine range checksums into the same CRC-32 as one sequential pass."""
+        payload = bytes(range(256)) * 17 + b"tail"
+        splits = (0, 1, 7, 64, len(payload) - 3, len(payload))
+        combined = 0
+        for start, end in zip(splits, splits[1:]):
+            piece = payload[start:end]
+            combined = _crc32_combine(combined, zlib.crc32(piece) & 0xFFFFFFFF, len(piece))
+        self.assertEqual(combined, zlib.crc32(payload) & 0xFFFFFFFF)
+        self.assertEqual(_crc32_combine(0x12345678, 0, 0), 0x12345678)
+        self.assertEqual(file_digest("crc32", b""), "00000000")
+        self.assertEqual(file_digest("md5", b""), "d41d8cd98f00b204e9800998ecf8427e")
+
+    def test_directory_script_uses_selected_hash(self) -> None:
+        """Hash the archive with the probed command instead of sha256sum."""
+        client = AdbClient()
+        client._caps = ("crc32", "toybox crc32", True, True)
+        script = client._directory_script("/data/private")
+        self.assertIn('toybox crc32 < "$work/hash"', script)
+        self.assertNotIn("sha256sum", script)
+        self.assertIn("while test ${#digest} -lt 8; do digest=0$digest; done;", script)
 
     def test_large_ranges(self) -> None:
         """Cover a size beyond 4 GiB with aligned, non-overlapping ranges."""
@@ -230,6 +273,7 @@ class TransportTests(unittest.TestCase):
 
     def _parallel(self, compressed: bool, *, mode: str = "range", callback=None) -> tuple[bytes, list]:
         client = AdbClient()
+        client._caps = ("crc32", "crc32", True, True)
         size = 32 * 1024**2 + 137
         output = io.BytesIO()
         fixture = str(Path(__file__).with_name("stream_fixture.py"))
@@ -255,8 +299,11 @@ class TransportTests(unittest.TestCase):
             with patch.object(client, "_transfer_options", return_value=(4, compressed)):
                 with patch.object(client, "_root_command", side_effect=command):
                     with patch("adb_puller.adb.subprocess.Popen", side_effect=spawn):
-                        received = client.stream_file("/private/file", output, size, callback or (lambda c: None))
+                        received, digest = client.stream_file(
+                            "/private/file", output, size, callback or (lambda c: None),
+                        )
             self.assertEqual(received, size)
+            self.assertEqual(digest, file_digest("crc32", output.getvalue()))
             return output.getvalue(), processes
         finally:
             self.assertTrue(processes)
@@ -293,16 +340,17 @@ class TransportTests(unittest.TestCase):
     def test_archive_footer_boundaries(self) -> None:
         """Recognize a footer split across arbitrary byte boundaries."""
         payload = b"binary\0archive\xffdata"
-        frame = payload + b"\n" + hashlib.sha256(payload).hexdigest().encode() + b"\nADB_PULLER_ARCHIVE_OK\n"
+        frame = payload + b"\n" + f"{zlib.crc32(payload) & 0xFFFFFFFF:08x}".encode() + b"\nADB_PULLER_ARCHIVE_OK\n"
         for width in (1, 7, 64, 4096):
             with self.subTest(width=width):
                 chunks = iter([frame[i:i + width] for i in range(0, len(frame), width)] + [None])
-                reader = _ArchiveReader(lambda: next(chunks), lambda chunk: None)
+                reader = _ArchiveReader(lambda: next(chunks), lambda chunk: None, "crc32")
                 self.assertEqual(reader.read(), payload)
                 self.assertTrue(reader.ended)
 
     def _archive_stream(self, mode, callback=None, *, read_all=True):
         client = AdbClient()
+        client._caps = ("crc32", "crc32", True, True)
         fixture = str(Path(__file__).with_name("stream_fixture.py"))
         processes = []
         original_popen = subprocess.Popen

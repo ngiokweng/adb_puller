@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import gzip
-import hashlib
 import io
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -15,16 +14,17 @@ import tarfile
 from typing import BinaryIO, Callable
 import zlib
 
-from .adb import AdbClient, AdbError, DirectoryEntry
+from .adb import AdbClient, AdbError, DirectoryEntry, hash_label, hash_open_file
 
 
 @dataclass(frozen=True)
 class PullResult:
-    """Describe a verified local file, its byte count, and its SHA-256 digest."""
+    """Describe a verified local file, its byte count, and its integrity digest."""
 
     destination: Path
     size: int
-    sha256: str
+    digest: str
+    algorithm: str
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,7 @@ class DirectoryPullResult:
     destination: Path
     size: int
     file_count: int
+    algorithm: str = "crc32"
 
 
 def _local_relative(path: str) -> Path:
@@ -74,6 +75,16 @@ def _publish(temporary: Path, destination: Path, overwrite: bool) -> None:
         temporary.unlink()
 
 
+def _preallocate(fd: int, size: int) -> None:
+    """Reserve the destination size so parallel range writes do not extend the file."""
+    if size <= 0:
+        return
+    try:
+        os.truncate(fd, size)
+    except OSError:
+        return
+
+
 def pull_file(
     client: AdbClient,
     remote: str,
@@ -83,70 +94,65 @@ def pull_file(
     progress: Callable[[int, int], None] | None = None,
     stage: Callable[[str], None] | None = None,
 ) -> PullResult:
-    """Pull an absolute remote file to local with hash checks and optional callbacks.
+    """Pull an absolute remote file to local with a fast checksum and optional callbacks.
 
     An existing local directory receives the source basename. By default existing
-    files are preserved. Initial source hashing overlaps copying; publication
-    waits for all integrity checks. Return the destination, size, and SHA-256.
+    files are preserved. Bytes are hashed as they arrive, so publication does not
+    reread the file when the checksum can be combined. The phone hashes the
+    source once after the copy, without competing for storage during transfer.
+    Return the destination, size, and digest.
     """
     destination = _destination(remote, local)
     if os.path.lexists(destination) and not overwrite:
         raise FileExistsError(f"目的檔案已存在：{destination}；可用 --overwrite 允許覆寫。")
     if stage:
         stage("讀取來源資訊…")
-    with client.inspect_file_later(remote) as inspection:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if shutil.disk_usage(destination.parent).free < inspection.info.size:
-            raise AdbError(f"本機可用空間不足；需要至少 {inspection.info.size} bytes。")
+    client.ensure_capabilities()
+    info = client.file_info(remote)
+    label = hash_label(client.hash_algorithm)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(destination.parent).free < info.size:
+        raise AdbError(f"本機可用空間不足；需要至少 {info.size} bytes。")
 
-        copied = 0
+    copied = 0
 
-        def consume(chunk: bytes) -> None:
-            nonlocal copied
-            # Surface hash failures during copying instead of transferring a
-            # large file all the way before discovering a missing hash command.
-            if inspection.done():
-                inspection.result()
-            copied += len(chunk)
-            if progress:
-                progress(copied, inspection.info.size)
+    def consume(chunk: bytes) -> None:
+        nonlocal copied
+        copied += len(chunk)
+        if progress:
+            progress(copied, info.size)
 
-        descriptor, name = tempfile.mkstemp(
-            dir=destination.parent, prefix=f".{destination.name}.", suffix=".part"
-        )
-        temporary = Path(name)
-        try:
-            with os.fdopen(descriptor, "w+b") as output:
-                if stage:
-                    stage("直接從手機串流傳輸（同步計算來源 SHA-256）…")
-                received = client.stream_file(remote, output, inspection.info.size, consume)
-                if received != inspection.info.size or copied != inspection.info.size:
-                    raise AdbError("傳輸大小與來源不符。")
-                if stage:
-                    stage("驗證本機 SHA-256 並同步磁碟…")
-                # Parallel ranges arrive out of order. Read the assembled file
-                # in order while the initial remote hash may still be running.
-                output.seek(0)
-                digest = hashlib.sha256()
-                while chunk := output.read(4 * 1024 * 1024):
-                    digest.update(chunk)
-                if stage:
-                    stage("核對來源 SHA-256…")
-                before = inspection.result()
-                if digest.hexdigest() != before.sha256:
-                    raise AdbError("SHA-256 不一致：傳輸內容損毀或來源已變動。")
+    descriptor, name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f".{destination.name}.", suffix=".part"
+    )
+    temporary = Path(name)
+    try:
+        _preallocate(descriptor, info.size)
+        with os.fdopen(descriptor, "w+b", buffering=0) as output:
+            if stage:
+                stage(f"直接從手機串流傳輸（同步計算 {label}）…")
+            received, digest = client.stream_file(remote, output, info.size, consume)
+            if received != info.size or copied != info.size:
+                raise AdbError("傳輸大小與來源不符。")
+            if stage:
+                stage(f"核對來源 {label} 並同步磁碟…")
+            # The remote checksum starts immediately and overlaps fsync, and the
+            # MD5 reread when parallel ranges cannot be combined.
+            with client.inspect_file_later(remote) as inspection:
+                if digest is None:
+                    digest = hash_open_file(output, client.hash_algorithm)
                 output.flush()
                 os.fsync(output.fileno())
-
-            if stage:
-                stage("重新檢查來源 SHA-256 與檔案資訊…")
-            after = client.inspect_file(remote)
-            if after != before:
+                after = inspection.result()
+            if after.algorithm != client.hash_algorithm or digest != after.digest:
+                raise AdbError(f"{label} 不一致：傳輸內容損毀或來源已變動。")
+            if after.info != info:
                 raise AdbError("傳輸期間來源檔案已變動；請停止寫入該檔案後重試。")
-            _publish(temporary, destination, overwrite)
-            return PullResult(destination, copied, digest.hexdigest())
-        finally:
-            temporary.unlink(missing_ok=True)
+
+        _publish(temporary, destination, overwrite)
+        return PullResult(destination, copied, digest, client.hash_algorithm)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def pull_directory(
@@ -158,7 +164,7 @@ def pull_directory(
     progress: Callable[[int, int], None] | None = None,
     stage: Callable[[str], None] | None = None,
 ) -> DirectoryPullResult:
-    """Pull one tar/gzip stream, verify its SHA-256, then publish its contents.
+    """Pull one tar/gzip stream, verify its checksum, then publish its contents.
 
     An existing local directory receives the source basename. With overwrite,
     merge into that destination, preserving unrelated files. progress receives
@@ -171,6 +177,8 @@ def pull_directory(
         raise FileExistsError(f"目的目錄已存在：{destination}；可用 --overwrite 允許合併覆寫。")
     if stage:
         stage("讀取來源目錄清單…")
+    client.ensure_capabilities()
+    label = hash_label(client.hash_algorithm)
     entries = client.list_directory(remote)
     targets = [(destination, True)]
     seen: set[str] = set()
@@ -197,11 +205,11 @@ def pull_directory(
     ) as temporary:
         staging = Path(temporary)
         if stage:
-            stage("整個目錄打包並串流傳輸（手機同步壓縮／計算整批 SHA-256）…")
+            stage(f"整個目錄打包並串流傳輸（手機同步壓縮／計算整批 {label}）…")
         with client.stream_directory(remote, consume) as source:
             size, count = _extract_directory(source, staging, entries)
             if stage:
-                stage("核對整批 SHA-256…")
+                stage(f"核對整批 {label}…")
         # Local paths may have changed while the archive was being downloaded.
         _check_directory_targets(targets, overwrite)
         if stage:
@@ -215,7 +223,7 @@ def pull_directory(
                 else:
                     relative = target.relative_to(destination)
                     _publish(staging / relative, target, overwrite)
-    return DirectoryPullResult(destination, size, count)
+    return DirectoryPullResult(destination, size, count, client.hash_algorithm)
 
 
 def _check_directory_targets(targets: list[tuple[Path, bool]], overwrite: bool) -> None:
@@ -288,7 +296,7 @@ def _extract_directory(
                 extracted.add(name)
         if extracted != expected.keys():
             raise AdbError("打包內容缺少檔案或目錄；來源可能已變動。")
-        # Read gzip's trailer too, checking CRC/length and the outer SHA-256
+        # Read gzip's trailer too, checking CRC/length and the outer checksum
         # frame even when tar stopped at its end-of-archive padding.
         while archive.read(4 * 1024 * 1024):
             pass
